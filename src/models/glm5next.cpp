@@ -840,7 +840,10 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
     }
 
-    if (inp_out_ids) {
+    // unmasked nextn needs a hidden row per token; crop after output_norm instead
+    const bool keep_all_nextn = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+
+    if (inp_out_ids && !keep_all_nextn) {
         // flattened: get_rows needs one token's streams to be one contiguous row
         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
         inpL = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flat, inp_out_ids), n_embd, hc, n_outputs);
@@ -851,6 +854,13 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     cb(cur, "hc_mean", -1);
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    if (keep_all_nextn && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 

@@ -35,8 +35,12 @@ static uint32_t glm5next_n_select(const llama_hparams & hparams) {
 
 void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-    // indexer k_norm is a LayerNorm with bias; without this key it runs at eps 0
-    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,     hparams.f_norm_eps);
+    // indexer k_norm is a LayerNorm with bias; without this key it runs at eps 0.
+    // optional: early glm5next GGUFs only wrote rms eps. reference hardcodes 1e-6
+    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,     hparams.f_norm_eps, false);
+    if (hparams.f_norm_eps <= 0.0f) {
+        hparams.f_norm_eps = 1e-6f;
+    }
     // The reference HARDCODES nn.LayerNorm(index_head_dim, eps=1e-6); it does not
     // read it from the config, and rms_norm_eps is 1e-5. Warned about rather than
     // asserted, for two reasons. No output comparison can see it: seeding eps=1e-5
@@ -73,7 +77,12 @@ void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
-    ml.get_key(LLM_KV_ATTENTION_INDEXER_KPOOL,      hparams.indexer_kpool);
+    ml.get_key(LLM_KV_ATTENTION_INDEXER_KPOOL,      hparams.indexer_kpool, false);
+    if (hparams.indexer_kpool == 0) {
+        // GLM-5.3-Flash config.json index_kpool is 4; early GGUFs omitted the key
+        hparams.indexer_kpool = 4;
+        LLAMA_LOG_WARN("%s: missing indexer.kpool, defaulting to 4\n", __func__);
+    }
     GGML_ASSERT(hparams.indexer_kpool > 0);
     GGML_ASSERT(hparams.indexer_top_k % hparams.indexer_kpool == 0);
 
@@ -235,8 +244,15 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
             layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", il), {q_lora_rank, hparams.indexer_n_head * n_embd_indexer}, flags);
 
             // key pooling: DeepSeek-V4 doubles the compressor width, GLM-5.3 does not
-            layer.indexer_comp_wgate = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, "weight", il), {n_embd, n_embd_indexer}, flags);
-            layer.indexer_comp_ape   = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_APE,   "weight", il), {n_embd_indexer, kpool}, flags);
+            // accept both Unsloth `.weight` names and the suffix-less convert names
+            layer.indexer_comp_wgate = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, "weight", il), {n_embd, n_embd_indexer}, flags | TENSOR_NOT_REQUIRED);
+            if (!layer.indexer_comp_wgate) {
+                layer.indexer_comp_wgate = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, il), {n_embd, n_embd_indexer}, flags);
+            }
+            layer.indexer_comp_ape = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_APE, "weight", il), {n_embd_indexer, kpool}, flags | TENSOR_NOT_REQUIRED);
+            if (!layer.indexer_comp_ape) {
+                layer.indexer_comp_ape = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_APE, il), {n_embd_indexer, kpool}, flags);
+            }
         }
 
         if (il < (int) hparams.n_layer_dense_lead) {
@@ -846,9 +862,112 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
 }
 
 std::unique_ptr<llm_graph_context> llama_model_glm5next::build_arch_graph(const llm_graph_params & params) const {
-    // llama_init_from_model accepts an MTP context whenever n_layer_nextn > 0,
-    // which every glm5next checkpoint has; without this it silently runs the trunk
-    GGML_ASSERT(params.gtype != LLM_GRAPH_TYPE_DECODER_MTP && "glm5next NextN graph not implemented yet");
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        return std::make_unique<graph_mtp>(*this, params);
+    }
 
     return std::make_unique<graph>(*this, params);
+}
+
+// NextN draft: enorm(embed) + hnorm(prev_hidden) -> concat -> eh_proj ->
+// dense NoPE MLA (same absorbed path as a trunk DSA layer with scoring off) +
+// sigmoid MoE + shared expert. No mHC. Indexer tensors are loaded but unused,
+// matching GLM-5.2 MTP (index_share_for_mtp_iteration).
+llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+    : graph(params) {
+    GGML_ASSERT(hparams.n_layer_nextn > 0 && "glm5next MTP requires n_layer_nextn > 0");
+    GGML_ASSERT(hparams.n_layer_nextn == 1 && "glm5next MTP currently only supports a single MTP block");
+    GGML_ASSERT(hparams.is_mla() && "glm5next MTP requires MLA");
+    GGML_ASSERT(hparams.n_rot() == 0 && "glm5next MLA is nope-only");
+
+    const int il = hparams.n_layer() + cparams.nextn_layer_offset;
+    GGML_ASSERT(cparams.nextn_layer_offset >= 0 &&
+                cparams.nextn_layer_offset < (int) hparams.n_layer_nextn &&
+                "nextn_layer_offset out of range [0, n_layer_nextn)");
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
+    GGML_ASSERT(layer.nextn.enorm   && "MTP block missing nextn.enorm");
+    GGML_ASSERT(layer.nextn.hnorm   && "MTP block missing nextn.hnorm");
+    GGML_ASSERT(layer.ffn_gate_inp  && "MTP block missing ffn_gate_inp");
+    GGML_ASSERT(!hparams.is_recr(il) && "MTP block must be DSA, not KDA");
+
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+    ggml_set_input(inp->embd);
+
+    ggml_tensor * tok_embd;
+    if (ubatch.token) {
+        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+    } else {
+        tok_embd = inp->embd;
+    }
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    ggml_tensor * h_embd = inp->h;
+    res->add_input(std::move(inp));
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    auto * inp_attn = build_attn_inp_k();
+
+    ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+    cb(h_norm, "mtp_hnorm", il);
+
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    cb(e_norm, "mtp_enorm", il);
+
+    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
+    cb(concat, "mtp_concat", il);
+
+    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
+    cb(cur, "mtp_eh_proj", il);
+
+    ggml_tensor * inpSA = cur;
+
+    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_attn_norm", il);
+
+    cur = build_dsa_layer(layer, inp_attn, nullptr, false, cur, il);
+    cb(cur, "mtp_attn_out", il);
+
+    ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+    cb(ffn_inp, "mtp_ffn_inp", il);
+
+    cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    cb(cur, "mtp_ffn_norm", il);
+
+    cur = build_layer_ffn(model, cur, il);
+    cb(cur, "mtp_ffn_out", il);
+
+    cur = ggml_add(ctx0, cur, ffn_inp);
+    cb(cur, "mtp_post_ffn", il);
+
+    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
+            ? layer.nextn.shared_head_norm
+            : model.output_norm;
+    GGML_ASSERT(head_norm_w && "glm5next MTP: missing both nextn.shared_head_norm and output_norm");
+    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    cb(cur, "mtp_shared_head_norm", -1);
+
+    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+    GGML_ASSERT(head_w && "glm5next MTP: missing LM head (nextn.shared_head_head or model.output)");
+    cur = build_lora_mm(head_w, cur, head_s);
+    cb(cur, "result_output", -1);
+
+    res->t_logits = cur;
+    ggml_build_forward_expand(gf, cur);
 }

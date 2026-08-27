@@ -1350,6 +1350,7 @@ struct llama_model_glm5next : public llama_model_base {
     // (unweighted mean, not a learned gated head), so derive rather than restate
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
+        explicit graph(const llm_graph_params & params) : llama_model_deepseek4::graph(params) {}
 
         // not const: the delta-net helpers append to the graph through the base
         ggml_tensor * build_layer_attn(
@@ -1395,6 +1396,10 @@ struct llama_model_glm5next : public llama_model_base {
                 const llama_model & model,
                 ggml_tensor * cur,
                 int il) const;
+    };
+
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
